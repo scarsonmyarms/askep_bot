@@ -1,248 +1,289 @@
-"""
-Масове додавання бота розсилок у ваші групи й канали від імені ВАШОГО акаунта Telegram.
+# Бот розсилок у закриті чати за розкладом
 
-Як це працює:
-  1. Скрипт входить у ваш акаунт через Telegram API (Telethon).
-  2. Показує групи й канали, куди ви можете додати бота і де його ще немає.
-  3. Ви обираєте потрібні (номери, діапазони або all) — і скрипт по черзі додає бота:
-       • канали          — адміністратором з правом публікації (потрібне ваше право «Додавати адміністраторів»);
-       • супергрупи      — учасником (якщо ви адмін із правом запрошувати або учасникам дозволено запрошувати);
-       • звичайні групи  — учасником (так само).
-  4. Якщо в боті увімкнено «Режим прийому» для пулу — усі ці чати автоматично потраплять у пул.
+## Встановлення
 
-Діагностика:
-  python add_bot_bulk.py --diagnose
-  Показує ВСІ ваші групи й канали з причиною, чому чат є або немає в списку, а також ID чатів,
-  де бот уже є — їх можна вставити в боті: «💬 Чати» → «➕ Зареєструвати вручну».
+1. Створіть бота в @BotFather, отримайте токен.
+2. Python 3.10+:
+   ```bash
+   python -m venv venv && source venv/bin/activate
+   pip install -r requirements.txt
+   cp .env.example .env   # заповніть BOT_TOKEN і ADMIN_IDS
+   python bot.py
+   ```
+   Свій Telegram ID можна дізнатися, написавши боту /start до того, як ви стали адміном.
 
-Важливо:
-  • Акаунт, від імені якого працює скрипт, має бути власником або адміністратором бота (інакше бот вийде з чатів).
-  • Файл сесії (*.session) дає повний доступ до акаунта — зберігайте його як пароль, не передавайте.
-  • Telegram обмежує масові дії. Не зменшуйте затримку без потреби: при занадто частих запитах
-    акаунт може отримати тимчасові обмеження.
+## Підключення чатів
 
-Запуск:
-  pip install -r requirements-userbot.txt
-  python add_bot_bulk.py              # інтерактивний вибір
-  python add_bot_bulk.py --dry-run    # лише показати, що буде зроблено
-  python add_bot_bulk.py --diagnose   # причини видимості кожного чату + ID чатів, де бот уже є
-"""
+- **Групи / супергрупи**: додайте бота в чат (достатньо звичайного учасника з правом писати). Чат з'явиться в «💬 Чати» автоматично.
+- **Канали**: додайте бота адміністратором з правом публікації.
+- Якщо бот був у групі до запуску — надішліть там `/register` (від імені адміна).
+- **Найшвидший спосіб — посилання пулу**: `/admin` → «Пули чатів» → пул → «🔗 Посилання для додавання».
+  - **📲 Обирати чати тут (рекомендовано)**: під полем вводу з'являються кнопки «➕ Група» / «📢 Канал».
+    Оберіть чат → підтвердьте додавання бота → ви лишаєтесь у чаті з ботом і обираєте наступний.
+    Наприкінці — «✅ Готово». Показуються лише чати, де ви адміністратор; бот додається адміністратором
+    з мінімальними правами (у каналах — з правом публікації).
+  - Групи: кнопка «➕ Додати в групу» → обрати групу → чат одразу потрапляє в цей пул.
+  - Канали: кнопка «📢 Додати в канал» додає бота адміністратором з правом публікації. Канали, додані
+    вами протягом 30 хв після відкриття посилань, потрапляють у цей пул (Telegram не передає параметр для каналів).
+  - «🔄 Оновити посилання» робить старе посилання групи недійсним.
+- Якщо бота додав не адмін і `RESTRICT_ADD=1`, бот вийде з чату й повідомить адмінів.
 
-import argparse
-import asyncio
-import os
-import random
+## Робота в адмін-панелі (`/admin`)
 
-from dotenv import load_dotenv
-from telethon import TelegramClient, errors, functions, types, utils
+1. **👥 Пули чатів** → «Створити пул» → натисканням позначте чати (✅).
+2. **📨 Нова розсилка** → надішліть повідомлення (текст, фото, відео, документ…) → оберіть пул → оберіть розклад:
+   - одразу;
+   - один раз: `ДД.ММ.РРРР ГГ:ХХ`;
+   - кожні N хвилин;
+   - щодня: `ГГ:ХХ` або кілька: `09:00, 18:30`.
+3. **📋 Розсилки** — пауза/увімкнення, запуск вручну, перегляд повідомлення, видалення.
 
-load_dotenv()
+## Важливо знати
 
-API_ID = os.getenv("TG_API_ID", "").strip()
-API_HASH = os.getenv("TG_API_HASH", "").strip()
-BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
-SESSION = os.getenv("TG_SESSION", "userbot")
-DELAY = float(os.getenv("BULK_DELAY", "15"))  # базова пауза між чатами, сек
+- Розсилка копіює (`copy_message`) повідомлення з чату адміна з ботом. **Не видаляйте його**, інакше розсилка не спрацює (перевірити можна кнопкою «👁 Показати повідомлення»).
+- Альбоми (кілька медіа в одному повідомленні) не підтримуються — розсилається одне медіа.
+- Розклади зберігаються в SQLite й відновлюються після перезапуску. Одноразові розсилки, пропущені більше ніж на 10 хв, поки бот був вимкнений, автоматично вимикаються.
+- Ліміти Telegram обробляються автоматично (очікування при flood control). Якщо бота видалили з чату — чат стає неактивним і пропускається.
+- Незавершені діалоги в панелі (FSM) скидаються при перезапуску — це нормально.
 
+## Запуск як сервіс (systemd)
 
-def is_broadcast(entity) -> bool:
-    return isinstance(entity, types.Channel) and bool(entity.broadcast)
+```ini
+[Unit]
+Description=Telegram broadcast bot
+After=network.target
 
+[Service]
+WorkingDirectory=/opt/broadcast-bot
+ExecStart=/opt/broadcast-bot/venv/bin/python bot.py
+Restart=always
 
-def kind_of(entity) -> str:
-    if isinstance(entity, types.Channel):
-        return "канал" if entity.broadcast else "супергрупа"
-    return "група"
+[Install]
+WantedBy=multi-user.target
+```
 
+## Масове додавання в багато чатів (скрипт `add_bot_bulk.py`)
 
-def eligibility(entity) -> tuple[bool, str]:
-    """Чи можна додати бота в чат і чому."""
-    if getattr(entity, "left", False):
-        return False, "ви вийшли з чату"
-    if isinstance(entity, types.Chat) and getattr(entity, "deactivated", False):
-        return False, "стару групу перетворено на супергрупу (шукайте її нову версію в списку)"
-    if getattr(entity, "creator", False):
-        return True, "ви власник"
-    rights = getattr(entity, "admin_rights", None)
-    if is_broadcast(entity):
-        if rights and rights.add_admins:
-            return True, "ви адмін із правом додавати адміністраторів"
-        if rights:
-            return False, "ви адмін каналу, але без права «Додавати адміністраторів»"
-        return False, "у каналі ви не адміністратор"
-    if rights and (rights.invite_users or rights.add_admins):
-        return True, "ви адмін із правом запрошувати"
-    banned = getattr(entity, "default_banned_rights", None)
-    if banned is None or not banned.invite_users:
-        return True, "учасникам дозволено запрошувати"
-    return False, "немає права додавати учасників (ні адмін, ні дозволу для учасників)"
+Через Bot API бот не може сам масово вступати в чати, тому скрипт робить це від імені **вашого акаунта**.
 
+1. Отримайте `api_id` і `api_hash` на https://my.telegram.org → API development tools, впишіть у `.env`
+   разом з `BOT_USERNAME` (див. `.env.example`).
+2. `pip install -r requirements-userbot.txt`
+3. У боті: `/admin` → «Пули чатів» → пул → **«🤖 Масове додавання» → «▶️ Увімкнути режим прийому»**.
+4. `python add_bot_bulk.py` — при першому запуску введіть номер телефону й код з Telegram.
+   Скрипт покаже чати, де ви адміністратор і де бота ще немає; оберіть `all` або номери (`1,3,5-20`).
+5. Бот додається з паузою ~15–20 с між чатами (50 чатів ≈ 15 хв). Кожен чат автоматично потрапляє в пул,
+   лічильник видно в боті на екрані режиму прийому.
 
-async def bot_membership(client: TelegramClient, entity, bot) -> bool | None:
-    """True — бот уже в чаті, False — немає, None — перевірити не вдалося (спробуємо додати)."""
-    for _ in range(2):
-        try:
-            if isinstance(entity, types.Channel):
-                await client(functions.channels.GetParticipantRequest(entity, bot))
-                return True
-            full = await client(functions.messages.GetFullChatRequest(entity.id))
-            participants = getattr(full.full_chat.participants, "participants", [])
-            return any(p.user_id == bot.user_id for p in participants)
-        except errors.UserNotParticipantError:
-            return False
-        except errors.FloodWaitError as e:
-            print(f"  ⏳ Telegram просить зачекати {e.seconds} с…")
-            await asyncio.sleep(e.seconds + 2)
-        except errors.RPCError:
-            # Напр., у супергрупі без прав адміна список учасників може бути недоступний
-            return None
-    return None
+Обмеження та безпека:
+- Акаунт, від якого працює скрипт, має бути власником (`ADMIN_IDS`) або адміністратором бота.
+- Файл `userbot.session` дає повний доступ до акаунта: не передавайте його й не додавайте в git.
+- Не зменшуйте `BULK_DELAY` без потреби — за надто частих дій Telegram може тимчасово обмежити акаунт.
+- `python add_bot_bulk.py --dry-run` — лише показати список, нічого не змінюючи.
+- Уже доданим чатам без пулу: пул → **«☑️ Додати в пул усі активні чати»**.
 
+## Логи чатів для аналізу
 
-async def add_bot(client: TelegramClient, entity, bot) -> None:
-    if is_broadcast(entity):
-        await client(functions.channels.EditAdminRequest(
-            channel=entity, user_id=bot,
-            admin_rights=types.ChatAdminRights(post_messages=True),
-            rank="",
-        ))
-    elif isinstance(entity, types.Channel):
-        await client(functions.channels.InviteToChannelRequest(channel=entity, users=[bot]))
-    else:
-        await client(functions.messages.AddChatUserRequest(chat_id=entity.id, user_id=bot, fwd_limit=0))
+Бот зберігає **нові** повідомлення з чатів, що входять хоча б в один пул (стару історію бот отримати не може).
 
+- Зберігаються: ID чату, ID повідомлення, гілка (topic), дата, дата редагування, тип, текст або підпис,
+  відповідь на яке повідомлення, ID альбому, ознака пересилання.
+- **Не зберігаються**: будь-які дані про авторів (ID, імена, username, джерело пересилання), самі медіафайли,
+  вміст контактів і геолокацій (лише тип), службові повідомлення (вхід/вихід учасників тощо).
+- Відредаговані повідомлення оновлюються в базі.
+- Експорт: `/admin` → «📊 Логи чатів» → пул або всі чати → період → бот надсилає JSON
+  (якщо файл більший за 45 МБ — ZIP).
+- Строк зберігання: `LOG_RETENTION_DAYS` (щоночі о 03:30 старі записи видаляються). Повне очищення — кнопкою в боті.
 
-def parse_selection(raw: str, total: int) -> list[int]:
-    raw = raw.strip().lower()
-    if raw in ("all", "усі", "все"):
-        return list(range(total))
-    result = set()
-    for part in raw.replace(" ", "").split(","):
-        if not part:
-            continue
-        if "-" in part:
-            a, b = part.split("-", 1)
-            result.update(range(int(a) - 1, int(b)))
-        else:
-            result.add(int(part) - 1)
-    return sorted(i for i in result if 0 <= i < total)
+**Щоб бот бачив усі повідомлення**, у групах, де він звичайний учасник (наприклад, доданий скриптом),
+вимкніть Privacy Mode: @BotFather → /setprivacy → бот → Disable. Після зміни Telegram може вимагати
+видалити й повторно додати бота в групи. Там, де бот адміністратор, він і так бачить усі повідомлення.
 
+Структура JSON:
+```json
+{
+  "exported_at": "2026-09-30T12:00:00+03:00",
+  "timezone": "Europe/Kyiv",
+  "pool": {"id": 1, "name": "Клієнти"},
+  "period_days": 7,
+  "chats": [{"chat_id": -100123, "title": "Група А", "type": "supergroup", "messages_count": 42}],
+  "messages": [{"chat_id": -100123, "message_id": 10, "thread_id": null, "date": "2026-09-29T18:03:11+03:00",
+                "edit_date": null, "content_type": "text", "text": "…", "reply_to_message_id": null,
+                "media_group_id": null, "is_forward": false}]
+}
+```
 
-async def scan(client: TelegramClient, bot, diagnose: bool):
-    """Повертає (кандидати, чати з ботом). У режиму діагностики друкує причину для кожного чату."""
-    candidates, with_bot = [], []
-    async for dialog in client.iter_dialogs():  # включно з архівом і папками
-        entity = dialog.entity
-        if not isinstance(entity, (types.Chat, types.Channel)):
-            if diagnose and isinstance(entity, (types.ChatForbidden, types.ChannelForbidden)):
-                print(f"  ⛔ [{dialog.name}] — вас видалено або чат недоступний")
-            continue
-        ok, reason = eligibility(entity)
-        membership = await bot_membership(client, entity, bot) if not getattr(entity, "left", False) else None
-        label = f"[{kind_of(entity)}] {entity.title}"
-        if membership:
-            with_bot.append(entity)
-            if diagnose:
-                print(f"  🤖 {label} — бот уже є (ID {utils.get_peer_id(entity)})")
-            continue
-        if ok:
-            candidates.append((entity, membership is None))
-            if diagnose:
-                note = " (наявність бота перевірити не вдалося)" if membership is None else ""
-                print(f"  ✅ {label} — можна додати: {reason}{note}")
-        elif diagnose:
-            print(f"  ⛔ {label} — {reason}")
-    return candidates, with_bot
+> Тексти повідомлень можуть містити персональні дані (імена, телефони тощо), навіть без даних про авторів.
+> Зберігайте експорти в захищеному місці, обмежте строк зберігання й, за потреби, повідомте учасників чатів
+> про збір повідомлень.
 
+## Автопересилання з каналу в пул
 
-async def main(dry_run: bool, diagnose: bool) -> None:
-    if not (API_ID and API_HASH and BOT_USERNAME):
-        raise SystemExit("Заповніть TG_API_ID, TG_API_HASH і BOT_USERNAME у .env (див. README)")
+Нові дописи каналу-джерела автоматично надсилаються в усі активні чати пулу.
 
-    client = TelegramClient(SESSION, int(API_ID), API_HASH)
-    await client.start()  # при першому запуску попросить номер телефону й код з Telegram
-    me = await client.get_me()
-    bot = await client.get_input_entity(BOT_USERNAME)
-    print(f"Увійшли як {me.first_name} (ID {me.id}). Бот: @{BOT_USERNAME}\n")
-    print("Сканую ваші групи й канали (включно з архівом)…\n")
+1. `/admin` → «🔁 Автопересилання» → «➕ Нове автопересилання».
+2. Оберіть канал-джерело зі списку або кнопкою «📢 Обрати канал-джерело» під полем вводу
+   (бот додасться в канал адміністратором без права публікації — цього достатньо, щоб бачити нові дописи).
+3. Оберіть пул і режим:
+   - **Копія** — повідомлення від імені бота, без згадки каналу;
+   - **Пересилання** — з підписом «Переслано з …» і посиланням на канал.
 
-    candidates, with_bot = await scan(client, bot, diagnose)
+Особливості:
+- Альбоми пересилаються цілим альбомом; порядок дописів зберігається.
+- Службові дописи (закріплення, зміна назви) не пересилаються.
+- Редагування та видалення дописів у каналі в чати **не** передаються.
+- Сам канал-джерело ніколи не отримує власні дописи, навіть якщо він входить у пул.
+- Якщо в каналі увімкнено «Заборонити копіювання» (захищений вміст), Telegram не дозволить ні копіювати,
+  ні пересилати дописи — бот повідомить адмінів, що доставка не вдалася.
+- Одне джерело можна прив'язати до кількох пулів (окремим автопересиланням для кожного).
 
-    if with_bot:
-        ids = ", ".join(str(utils.get_peer_id(e)) for e in with_bot)
-        print(f"\n🤖 Бот уже є в {len(with_bot)} чатах. Якщо якихось із них немає в списку бота —\n"
-              f"вставте ці ID у боті: «💬 Чати» → «➕ Зареєструвати вручну»:\n{ids}\n")
+## Адміністратори
 
-    if diagnose:
-        print(f"Можна додати: {len(candidates)}. Діагностику завершено, нічого не змінено.")
-        await client.disconnect()
-        return
+- **Власники** — ID з `ADMIN_IDS` у `.env`. Мають повний доступ, лише вони додають і видаляють адміністраторів;
+  через бота їх змінити не можна.
+- **Адміністратори** — додаються в боті: `/admin` → «👤 Адміністратори» → «➕ Додати адміністратора».
+  Можна обрати до 10 людей кнопкою «👤 Обрати користувачів» або надіслати числовий Telegram ID.
+  Мають доступ до всіх функцій, крім керування адміністраторами.
+- Новий адміністратор має хоча б раз написати боту `/start`, щоб отримувати сповіщення.
+- Про кожне додавання/видалення бот повідомляє інших власників.
 
-    if not candidates:
-        print("Немає чатів, куди можна додати бота. Запустіть з --diagnose, щоб побачити причини.")
-        await client.disconnect()
-        return
+## Чому якогось чату не видно
 
-    print(f"Можна додати бота в {len(candidates)} чатів:\n")
-    for i, (entity, unknown) in enumerate(candidates, 1):
-        print(f"  {i:>3}. [{kind_of(entity)}] {entity.title}{'  (?) можливо, бот уже є' if unknown else ''}")
-    print("\nНемає потрібного чату? Запустіть з --diagnose — скрипт покаже причину для кожного.")
+| Спосіб | Які чати показує Telegram |
+|---|---|
+| «📲 Обирати чати тут» | лише ті, де ви адміністратор із правом **«Додавати адміністраторів»** (бот додається адміном) |
+| «➕ Додати в групу» (посилання) | усі групи, куди ви можете додавати учасників |
+| «📢 Додати в канал» (посилання) | канали, де ви адмін із правом додавати адміністраторів |
+| `add_bot_bulk.py` | групи, де ви адмін із правом запрошувати **або** учасникам дозволено запрошувати; канали — як вище |
 
-    raw = input("\nОберіть чати: номери через кому, діапазони (1-10) або all. Порожньо — вихід: ")
-    selected = [candidates[i][0] for i in parse_selection(raw, len(candidates))] if raw.strip() else []
-    if not selected:
-        print("Нічого не обрано.")
-        await client.disconnect()
-        return
+- `python add_bot_bulk.py --diagnose` показує всі ваші групи й канали (включно з архівом) з причиною для кожного.
+- Якщо бот уже в чаті, але чату немає в списку бота (наприклад, бота додали, коли він був вимкнений або
+  працював webhook) — «💬 Чати» → «➕ Зареєструвати вручну»: вставте ID чатів (їх виводить `--diagnose`)
+  або перешліть допис із каналу.
 
-    print(f"\nОбрано {len(selected)} чатів. Орієнтовний час: ~{len(selected) * DELAY / 60:.0f} хв.")
-    if dry_run:
-        print("Режим --dry-run: нічого не змінено.")
-        await client.disconnect()
-        return
-    print("Переконайтеся, що в боті увімкнено «🤖 Масове додавання → Режим прийому» для потрібного пулу.")
-    if input("Почати? (так/ні): ").strip().lower() not in ("так", "yes", "y", "т"):
-        print("Скасовано.")
-        await client.disconnect()
-        return
+## Безкоштовний деплой: Render Free + PostgreSQL (Supabase / Neon) + UptimeRobot
 
-    ok, failed = 0, []
-    for n, entity in enumerate(selected, 1):
-        while True:
-            try:
-                await add_bot(client, entity, bot)
-                ok += 1
-                print(f"  ✅ {n}/{len(selected)} {entity.title}")
-                break
-            except errors.UserAlreadyParticipantError:
-                ok += 1
-                print(f"  ✅ {n}/{len(selected)} {entity.title} — бот уже був у чаті")
-                break
-            except errors.FloodWaitError as e:
-                print(f"  ⏳ Telegram просить зачекати {e.seconds} с…")
-                await asyncio.sleep(e.seconds + 5)
-            except errors.RPCError as e:
-                failed.append((entity.title, e.__class__.__name__))
-                print(f"  ❌ {n}/{len(selected)} {entity.title}: {e.__class__.__name__}")
-                break
-        if n < len(selected):
-            await asyncio.sleep(DELAY + random.uniform(0, DELAY / 3))
+Схема: бот працює як безкоштовний **Web Service** на Render, дані — у зовнішньому **PostgreSQL**,
+**UptimeRobot** кожні 5 хв звертається до `/health`, щоб сервіс не засинав, а **блокування лідера** гарантує,
+що під час деплою (коли на кілька секунд працюють дві копії) розсилки не підуть двічі.
 
-    print(f"\nГотово: успішно {ok}, помилок {len(failed)}.")
-    if failed:
-        print("Не вдалося додати:")
-        for title, err in failed:
-            print(f"  • {title}: {err}")
-        print("\nПоширені причини: BotGroupsBlockedError — у @BotFather вимкнено «Allow Groups»; "
-              "ChatAdminRequiredError — недостатньо прав; UserBannedInChannelError — бота заблоковано в чаті; "
-              "UserPrivacyRestrictedError / UserNotMutualContactError — обмеження на запрошення в цьому чаті.")
-    await client.disconnect()
+> Ліміти безкоштовних тарифів змінюються — перевірте їх на сайтах сервісів перед стартом.
 
+### 1. База даних
+**Supabase (рекомендовано)**: New project → регіон **EU (Frankfurt)** → складний пароль бази.
+Рядок підключення: кнопка **Connect** → **Session pooler** (сумісний з IPv4) → URI, підставте пароль.
+Пряме підключення в Supabase може працювати лише через IPv6 — тому беріть саме Session pooler.
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Масове додавання бота в групи й канали")
-    parser.add_argument("--dry-run", action="store_true", help="лише показати список, нічого не змінювати")
-    parser.add_argument("--diagnose", action="store_true",
-                        help="показати причину видимості кожного чату та ID чатів, де бот уже є")
-    args = parser.parse_args()
-    asyncio.run(main(args.dry_run, args.diagnose))
+**Neon** — альтернатива: регіон EU (Frankfurt), рядок підключення з `?sslmode=require`.
+Зауважте: бот звертається до бази кожні ~20 с (продовження блокування лідера), тож база не «засинає»,
+і безкоштовний ліміт обчислювальних годин Neon може вичерпатися — перевірте його умови.
+
+Бот сам створить таблиці при першому запуску й увімкне на них Row Level Security
+(щоб дані не були доступні через Supabase Data API).
+
+### 2. Перенесення наявних даних (якщо є локальний bot.db)
+Зупиніть бота, потім на своєму комп'ютері:
+```bash
+pip install -r requirements.txt
+DATABASE_URL="postgresql://..." python migrate_to_postgres.py --sqlite bot.db
+```
+(у Windows PowerShell: `$env:DATABASE_URL="postgresql://..."; python migrate_to_postgres.py --sqlite bot.db`)
+
+### 3. Render
+**New → Blueprint** (з `render.yaml`) або **New → Web Service** вручну:
+- Build: `pip install -r requirements.txt`, Start: `python bot.py`, Instance: **Free**, регіон Frankfurt;
+- Health Check Path: `/health`;
+- Environment: `BOT_TOKEN`, `ADMIN_IDS`, `DATABASE_URL`, `TZ_NAME=Europe/Kyiv`, `LOG_RETENTION_DAYS=90`.
+Версію Python задає файл `.python-version`.
+
+У логах після деплою має бути:
+```
+Database: PostgreSQL postgresql://...:***@...
+Health endpoint listening on port 10000
+This instance is the leader (...)
+Run polling for bot @...
+```
+Під час наступних деплоїв нова копія спершу пише `Standby: another instance is the leader`, а щойно стара
+зупиниться — `This instance is the leader`. Так і має бути.
+
+### 4. UptimeRobot
+New monitor → **HTTP(s)** → URL `https://<назва-сервісу>.onrender.com/health` → інтервал **5 хв**.
+Увімкніть сповіщення на e-mail/Telegram — дізнаєтеся, якщо бот впаде.
+`/health` повертає `{"status": "ok", "role": "leader", ...}`.
+
+### Обмеження й ризики безкоштовної схеми
+- Безкоштовний сервіс Render має ліміт годин на місяць (≈750) — вистачає рівно на один сервіс, що працює
+  цілодобово. Не створюйте інших безкоштовних сервісів у цьому ж акаунті.
+- Постійне «будіння» безкоштовного сервісу — сіра зона щодо правил Render; є ризик обмежень.
+- Після перезапуску Render (рідко) бот кілька десятків секунд недоступний; розклади відновлюються автоматично,
+  пропущені запуски виконуються, якщо затримка не більша за 10 хв.
+- База доступна з будь-якої IP-адреси (у Render Free немає фіксованих IP) — тримайте складний пароль і не
+  публікуйте `DATABASE_URL`.
+- Безкоштовні бази обмежені за обсягом (~0,5 ГБ) — найбільше займають логи чатів, тому `LOG_RETENTION_DAYS=90`.
+- Не запускайте бота з тим самим токеном локально: дві копії з однією базою — одна чекатиме (це безпечно),
+  але з різними базами — буде `TelegramConflictError` і можливі подвійні розсилки.
+
+## Тести
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+Кожен тест бази виконується на SQLite і на PostgreSQL (вбудований через `pgserver` або ваша тестова база
+в `TEST_DATABASE_URL` — **усі таблиці в ній буде видалено**).
+
+## Розгортання на Oracle Cloud Always Free (або будь-якому VPS з Ubuntu)
+
+### 1. Сервер в Oracle Cloud
+1. Зареєструйтеся на cloud.oracle.com. **Домашній регіон обирається один раз і назавжди** — беріть найближчий
+   у ЄС (наприклад, Frankfurt). Для верифікації потрібна банківська картка.
+2. Compute → Instances → **Create instance**:
+   - Image: **Ubuntu 22.04 або 24.04**;
+   - Shape: **VM.Standard.A1.Flex** (ARM) з 1 OCPU / 6 ГБ RAM — з запасом;
+     якщо пише «Out of capacity» — спробуйте пізніше або **VM.Standard.E2.1.Micro** (вистачить і його);
+   - SSH keys: завантажте свій публічний ключ або збережіть згенерований приватний.
+3. Вхідні порти відкривати **не потрібно**: бот сам звертається до Telegram (polling). Залиште лише SSH (22).
+
+### 2. Завантаження коду
+На своєму комп'ютері **зупиніть локального бота** (інакше буде `TelegramConflictError`).
+Якщо хочете перенести наявні чати й пули — покладіть свій `bot.db` у теку проєкту, а `.env` із заповненими
+`BOT_TOKEN` і `ADMIN_IDS` — теж туди (скрипт підхопить обидва).
+
+```bash
+scp -i <ключ> -r telegram_broadcast_bot ubuntu@<IP-сервера>:~/
+ssh -i <ключ> ubuntu@<IP-сервера>
+cd ~/telegram_broadcast_bot
+sudo bash deploy/install.sh
+```
+
+Скрипт встановить Python і залежності, створить системного користувача `botuser`, скопіює код у
+`/opt/broadcast-bot`, перенесе `bot.db` у `/opt/broadcast-bot/data/`, налаштує автозапуск, автоперезапуск після
+збоїв, автоматичні оновлення безпеки й щоденний бекап бази. Якщо `.env` не заповнений — підкаже, що робити.
+
+Після встановлення можна видалити `~/telegram_broadcast_bot` з сервера (особливо `.env` і `bot.db` у ньому).
+
+### 3. Керування
+```bash
+sudo journalctl -u broadcast-bot -f          # логи в реальному часі
+sudo systemctl restart broadcast-bot         # перезапуск
+sudo systemctl status broadcast-bot          # стан
+sudo nano /opt/broadcast-bot/.env            # налаштування (потім restart)
+```
+
+**Оновлення коду:** завантажте нову версію в `~/telegram_broadcast_bot` і знову запустіть
+`sudo bash deploy/install.sh` — код оновиться, бот перезапуститься, `.env`, база й бекапи не зміняться.
+
+### 4. Бекапи
+Щодня о 03:00 база копіюється в `/opt/broadcast-bot/backups/` (зберігаються 14 днів).
+Ці копії лежать на тому ж сервері, тож періодично забирайте їх собі:
+```bash
+# найсвіжіший бекап — на свій комп'ютер (тека бекапів доступна лише root і botuser)
+ssh -i <ключ> ubuntu@<IP> 'sudo sh -c "cat \$(ls -t /opt/broadcast-bot/backups/*.gz | head -1)"' > bot-backup.db.gz
+```
+Бекапи містять логи чатів — зберігайте їх у захищеному місці.
+
+### Застереження щодо Always Free
+- Oracle може **вилучати Always Free інстанси, що простоюють** (низьке навантаження на процесор тривалий час).
+  Бот навантажує сервер мінімально, тож ризик реальний. Наскільки відомо, на це не впливають акаунти,
+  переведені на **Pay As You Go** — безкоштовні ресурси лишаються безкоштовними, але перевірте актуальні умови
+  в документації Oracle і налаштуйте ліміт витрат (Budget) на 0–1 $ з оповіщенням.
+- Регулярно забирайте бекапи — на випадок, якщо інстанс таки буде вилучено.

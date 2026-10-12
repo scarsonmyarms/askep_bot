@@ -15,6 +15,7 @@ Telegram-бот для розсилки повідомлень у пули за�
 import asyncio
 import html
 import io
+import re
 import json
 import logging
 import os
@@ -24,7 +25,6 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
@@ -72,6 +72,8 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
 
+from storage import IntegrityError, LeaderLock, create_database, new_pool_token
+
 # ─────────────────────────── Конфігурація ───────────────────────────
 
 load_dotenv()
@@ -80,7 +82,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 # Власники бота (з .env): повний доступ, керують адміністраторами, не можуть бути видалені через бота.
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Kyiv"))
-DB_PATH = os.getenv("DB_PATH", "bot.db")
 NOTIFY_ADMINS = os.getenv("NOTIFY_ADMINS", "1") == "1"
 RESTRICT_ADD = os.getenv("RESTRICT_ADD", "1") == "1"  # бот виходить з чатів, куди його додав не адмін
 SEND_DELAY = float(os.getenv("SEND_DELAY", "0.1"))  # пауза між відправками, сек
@@ -123,140 +124,8 @@ def spawn(coro) -> None:
 
 # ─────────────────────────── База даних ───────────────────────────
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS chats (
-    chat_id   INTEGER PRIMARY KEY,
-    title     TEXT NOT NULL,
-    type      TEXT NOT NULL,
-    active    INTEGER NOT NULL DEFAULT 1,
-    added_at  TEXT
-);
-CREATE TABLE IF NOT EXISTS pools (
-    id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    name  TEXT NOT NULL UNIQUE
-);
-CREATE TABLE IF NOT EXISTS pool_chats (
-    pool_id  INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
-    chat_id  INTEGER NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
-    PRIMARY KEY (pool_id, chat_id)
-);
-CREATE TABLE IF NOT EXISTS tasks (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    pool_id         INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
-    src_chat_id     INTEGER NOT NULL,
-    src_message_id  INTEGER NOT NULL,
-    preview         TEXT,
-    schedule_type   TEXT NOT NULL,      -- once | interval | daily
-    schedule_value  TEXT NOT NULL,
-    enabled         INTEGER NOT NULL DEFAULT 1,
-    created_by      INTEGER,
-    created_at      TEXT,
-    last_run        TEXT
-);
--- Логи повідомлень з чатів пулів. Дані про авторів НЕ зберігаються.
-CREATE TABLE IF NOT EXISTS chat_logs (
-    chat_id              INTEGER NOT NULL,
-    message_id           INTEGER NOT NULL,
-    thread_id            INTEGER,
-    date_utc             TEXT NOT NULL,     -- YYYY-MM-DD HH:MM:SS (UTC)
-    edit_date_utc        TEXT,
-    content_type         TEXT NOT NULL,
-    text                 TEXT,
-    reply_to_message_id  INTEGER,
-    media_group_id       TEXT,
-    is_forward           INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (chat_id, message_id)
-);
-CREATE INDEX IF NOT EXISTS idx_chat_logs_date ON chat_logs(date_utc);
--- Адміністратори, додані через бота (власники задаються в .env → ADMIN_IDS)
-CREATE TABLE IF NOT EXISTS admins (
-    user_id   INTEGER PRIMARY KEY,
-    name      TEXT,
-    added_by  INTEGER,
-    added_at  TEXT
-);
--- Автопересилання: нові дописи каналу-джерела автоматично надсилаються в чати пулу
-CREATE TABLE IF NOT EXISTS relays (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_chat_id  INTEGER NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
-    pool_id         INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
-    mode            TEXT NOT NULL DEFAULT 'copy',   -- copy | forward
-    enabled         INTEGER NOT NULL DEFAULT 1,
-    posts_count     INTEGER NOT NULL DEFAULT 0,
-    last_post_at    TEXT,
-    last_result     TEXT,
-    created_at      TEXT,
-    UNIQUE (source_chat_id, pool_id)
-);
-"""
-
-
-def new_pool_token() -> str:
-    """Секретна частина посилання: не дає вгадати посилання іншого пулу."""
-    return secrets.token_urlsafe(9)  # 12 символів A-Z a-z 0-9 _ -
-
-
-class DB:
-    def __init__(self, path: str):
-        self.path = path
-
-    async def _connect(self) -> aiosqlite.Connection:
-        conn = await aiosqlite.connect(self.path)
-        conn.row_factory = aiosqlite.Row
-        await conn.execute("PRAGMA foreign_keys = ON")
-        return conn
-
-    async def init(self) -> None:
-        conn = await self._connect()
-        try:
-            await conn.executescript(SCHEMA)
-            # Міграція: секретний токен пулу для посилань додавання
-            async with conn.execute("PRAGMA table_info(pools)") as cur:
-                columns = {row["name"] for row in await cur.fetchall()}
-            if "invite_token" not in columns:
-                await conn.execute("ALTER TABLE pools ADD COLUMN invite_token TEXT")
-            await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_pools_token ON pools(invite_token)")
-            async with conn.execute("SELECT id FROM pools WHERE invite_token IS NULL") as cur:
-                missing = [row["id"] for row in await cur.fetchall()]
-            for pool_id in missing:
-                await conn.execute("UPDATE pools SET invite_token=? WHERE id=?", (new_pool_token(), pool_id))
-            await conn.commit()
-        finally:
-            await conn.close()
-
-    async def execute(self, sql: str, params: tuple = ()) -> int:
-        conn = await self._connect()
-        try:
-            cur = await conn.execute(sql, params)
-            await conn.commit()
-            return cur.lastrowid
-        finally:
-            await conn.close()
-
-    async def run_many(self, statements: list[tuple[str, tuple]]) -> None:
-        """Кілька запитів в одній транзакції."""
-        conn = await self._connect()
-        try:
-            for sql, params in statements:
-                await conn.execute(sql, params)
-            await conn.commit()
-        finally:
-            await conn.close()
-
-    async def fetchall(self, sql: str, params: tuple = ()) -> list[dict]:
-        conn = await self._connect()
-        try:
-            async with conn.execute(sql, params) as cur:
-                return [dict(r) for r in await cur.fetchall()]
-        finally:
-            await conn.close()
-
-    async def fetchone(self, sql: str, params: tuple = ()) -> dict | None:
-        rows = await self.fetchall(sql, params)
-        return rows[0] if rows else None
-
-
-db = DB(DB_PATH)
+# Схеми, бекенди (SQLite / PostgreSQL) та блокування лідера — у storage.py
+db = create_database()
 
 # ─────────────────────────── Адміністратори ───────────────────────────
 
@@ -296,11 +165,18 @@ async def set_chat_active(chat_id: int, active: bool) -> None:
 async def migrate_chat(old_id: int, new_id: int) -> None:
     """Група стала супергрупою — переносимо чат і його членство в пулах на новий ID."""
     await db.run_many([
-        ("""INSERT OR IGNORE INTO chats(chat_id, title, type, active, added_at)
-            SELECT ?, title, 'supergroup', 1, added_at FROM chats WHERE chat_id=?""", (new_id, old_id)),
-        ("""INSERT OR IGNORE INTO pool_chats(pool_id, chat_id)
-            SELECT pool_id, ? FROM pool_chats WHERE chat_id=?""", (new_id, old_id)),
-        ("UPDATE OR IGNORE chat_logs SET chat_id=? WHERE chat_id=?", (new_id, old_id)),
+        ("""INSERT INTO chats(chat_id, title, type, active, added_at)
+            SELECT CAST(? AS BIGINT), title, 'supergroup', 1, added_at FROM chats WHERE chat_id=?
+            ON CONFLICT DO NOTHING""", (new_id, old_id)),
+        ("""INSERT INTO pool_chats(pool_id, chat_id)
+            SELECT pool_id, CAST(? AS BIGINT) FROM pool_chats WHERE chat_id=?
+            ON CONFLICT DO NOTHING""", (new_id, old_id)),
+        ("""INSERT INTO chat_logs(chat_id, message_id, thread_id, date_utc, edit_date_utc, content_type, text,
+                                  reply_to_message_id, media_group_id, is_forward)
+            SELECT CAST(? AS BIGINT), message_id, thread_id, date_utc, edit_date_utc, content_type, text,
+                   reply_to_message_id, media_group_id, is_forward FROM chat_logs WHERE chat_id=?
+            ON CONFLICT DO NOTHING""", (new_id, old_id)),
+        ("DELETE FROM chat_logs WHERE chat_id=?", (old_id,)),
         ("DELETE FROM chats WHERE chat_id=?", (old_id,)),
     ])
     log.info("Chat migrated %s -> %s", old_id, new_id)
@@ -551,6 +427,10 @@ class PoolForm(StatesGroup):
     name = State()
 
 
+class ChatRegForm(StatesGroup):
+    ids = State()
+
+
 class AdminForm(StatesGroup):
     user_id = State()
 
@@ -612,7 +492,7 @@ async def add_chat_to_pool(pool_id: int, chat_id: int, title: str, notify_admins
         return False
     if await db.fetchone("SELECT 1 FROM pool_chats WHERE pool_id=? AND chat_id=?", (pool_id, chat_id)):
         return False
-    await db.execute("INSERT OR IGNORE INTO pool_chats(pool_id, chat_id) VALUES(?, ?)", (pool_id, chat_id))
+    await db.execute("INSERT INTO pool_chats(pool_id, chat_id) VALUES(?, ?) ON CONFLICT DO NOTHING", (pool_id, chat_id))
     invalidate_pooled_cache()
     if notify_admins:
         await notify(admin_ids(), f"📥 Чат <b>{esc(title)}</b> автоматично додано до пулу <b>{esc(pool['name'])}</b>.")
@@ -667,15 +547,17 @@ async def on_migrate(message: Message):
 LOGGED_TYPES = {"text", "photo", "video", "animation", "document", "audio", "voice", "video_note",
                 "sticker", "poll", "location", "venue", "contact", "dice", "story"}
 NO_CONTENT_TYPES = {"contact", "location", "venue"}
-_pooled_cache: dict = {"ids": set(), "at": 0.0}
+_pooled_cache: dict = {"ids": set(), "at": None}  # at=None — кеш не завантажений або скинутий
 
 
 def invalidate_pooled_cache() -> None:
-    _pooled_cache["at"] = 0.0
+    _pooled_cache["at"] = None
 
 
 async def is_pooled_chat(chat_id: int) -> bool:
-    if time.monotonic() - _pooled_cache["at"] > 30:
+    # Не порівнюємо з 0: time.monotonic() рахується від старту системи і в щойно запущеному контейнері
+    # може бути меншим за 30 с — тоді «скинутий» кеш помилково вважався б свіжим.
+    if _pooled_cache["at"] is None or time.monotonic() - _pooled_cache["at"] > 30:
         rows = await db.fetchall("SELECT DISTINCT chat_id FROM pool_chats")
         _pooled_cache["ids"] = {r["chat_id"] for r in rows}
         _pooled_cache["at"] = time.monotonic()
@@ -852,9 +734,77 @@ async def cb_chats(cb: CallbackQuery):
         text += "\n\nНатисніть на чат, щоб прибрати його зі списку."
         for c in chats:
             kb.button(text=f"🗑 {c['title'][:40]}", callback_data=f"cd:{c['chat_id']}")
+    kb.button(text="➕ Зареєструвати вручну (бот уже в чаті)", callback_data="creg")
     kb.button(text="⬅️ Меню", callback_data="menu")
     kb.adjust(1)
     await safe_edit(cb, text, kb.as_markup())
+
+
+# Ручна реєстрація: для чатів, куди бота додали, коли він був вимкнений понад 24 год або працював webhook,
+# тож подію про додавання бот не отримав і чату немає в списку.
+
+MAX_REGISTER_PER_MESSAGE = 200
+
+
+async def register_existing_chat(chat_id: int) -> str:
+    try:
+        me = await bot.me()
+        chat = await bot.get_chat(chat_id)
+        member = await bot.get_chat_member(chat_id, me.id)
+    except TelegramMigrateToChat as e:
+        return await register_existing_chat(e.migrate_to_chat_id)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return f"❌ <code>{chat_id}</code> — бот не має доступу (його немає в чаті або ID неправильний)"
+    if chat.type == ChatType.PRIVATE:
+        return f"❌ <code>{chat_id}</code> — це особистий чат, а не група чи канал"
+    title = chat.title or str(chat_id)
+    if member.status in ("left", "kicked"):
+        return f"❌ {esc(title)} — бот не є учасником"
+    await upsert_chat(chat.id, title, chat.type)
+    if chat.type == ChatType.CHANNEL and member.status != "administrator":
+        return f"⚠️ {esc(title)} — зареєстровано, але в каналі бот не адміністратор і не зможе публікувати"
+    return f"✅ {esc(title)} — зареєстровано"
+
+
+@admin_router.callback_query(F.data == "creg")
+async def cb_chat_register(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(ChatRegForm.ids)
+    await safe_edit(cb, "➕ <b>Ручна реєстрація чатів</b>\n\n"
+                        "Надішліть ID чатів (через кому, пробіл або з нового рядка), напр. "
+                        "<code>-1001234567890, -987654321</code>,\n"
+                        "або перешліть сюди будь-який допис із каналу.\n\n"
+                        "<i>ID усіх чатів, де бот уже є, виводить скрипт: "
+                        "<code>python add_bot_bulk.py --diagnose</code></i>", cancel_kb())
+
+
+@admin_router.message(ChatRegForm.ids)
+async def on_chat_register_ids(message: Message, state: FSMContext):
+    ids: list[int] = []
+    origin = message.forward_origin
+    if origin is not None and getattr(origin, "chat", None) is not None:
+        ids.append(origin.chat.id)
+    text = message.text or message.caption or ""
+    if not ids:
+        ids = list(dict.fromkeys(int(x) for x in re.findall(r"-?\d{5,}", text)))
+    if not ids:
+        return await message.answer("Не знайшов жодного ID. Надішліть ID чатів або перешліть допис із каналу.",
+                                    reply_markup=cancel_kb())
+    if len(ids) > MAX_REGISTER_PER_MESSAGE:
+        return await message.answer(f"Забагато ID за раз (максимум {MAX_REGISTER_PER_MESSAGE}). "
+                                    "Розбийте список на частини.", reply_markup=cancel_kb())
+    await state.clear()
+    progress = await message.answer(f"⏳ Перевіряю {len(ids)} чатів…")
+    results = []
+    for chat_id in ids:
+        results.append(await register_existing_chat(chat_id))
+        await asyncio.sleep(0.05)
+    ok = sum(r.startswith(("✅", "⚠️")) for r in results)
+    report = f"Зареєстровано: <b>{ok}</b> з {len(ids)}\n\n" + "\n".join(results)
+    if len(report) > 4000:
+        report = report[:3990] + "\n…"
+    await progress.edit_text(report)
+    await message.answer("Додайте нові чати до пулів: «👥 Пули чатів» → пул → позначте чати ✅ "
+                         "або «☑️ Додати в пул усі активні чати».", reply_markup=main_menu_kb())
 
 
 @admin_router.callback_query(F.data.startswith("cd:"))
@@ -937,7 +887,7 @@ async def cb_pool_toggle(cb: CallbackQuery):
     if exists:
         await db.execute("DELETE FROM pool_chats WHERE pool_id=? AND chat_id=?", (pid, cid))
     else:
-        await db.execute("INSERT OR IGNORE INTO pool_chats(pool_id, chat_id) VALUES(?, ?)", (pid, cid))
+        await db.execute("INSERT INTO pool_chats(pool_id, chat_id) VALUES(?, ?) ON CONFLICT DO NOTHING", (pid, cid))
     invalidate_pooled_cache()
     text, kb = await render_pool(pid)
     await safe_edit(cb, text, kb)
@@ -971,8 +921,11 @@ async def render_pool_links(pool_id: int, admin_id: int) -> tuple[str, InlineKey
     else:
         text += "\n\n<i>⚠️ RESTRICT_ADD вимкнено: будь-хто з посиланням на групу зможе додати свій чат у пул. " \
                 "Якщо посилання потрапило не туди — натисніть «Оновити посилання».</i>"
-    text = ("📲 <b>Рекомендовано:</b> кнопка «Обирати чати тут» — ви лишаєтесь у чаті з ботом і можете "
-            "додавати групи одну за одною без переходів.\n\n") + text
+    text = ("📲 <b>«Обирати чати тут»</b> — без переходів, але Telegram показує там лише чати, де ви "
+            "адміністратор із правом <b>«Додавати адміністраторів»</b> (бот додається адміном).\n"
+            "Якщо потрібної групи там немає — скористайтеся «➕ Додати в групу»: там видно всі групи, "
+            "куди ви можете додавати учасників.\n"
+            "Якщо бот уже в чаті, але чату немає в списку бота — «💬 Чати» → «➕ Зареєструвати вручну».\n\n") + text
     kb = InlineKeyboardBuilder()
     kb.button(text="📲 Обирати чати тут (без переходів)", callback_data=f"pk:{pool_id}")
     kb.button(text="➕ Додати в групу", url=group_link)
@@ -1056,8 +1009,8 @@ async def cb_bulk_off(cb: CallbackQuery):
 async def cb_pool_add_all(cb: CallbackQuery):
     pool_id = int(cb.data.split(":")[1])
     before = await count_active_in_pool(pool_id)
-    await db.execute("INSERT OR IGNORE INTO pool_chats(pool_id, chat_id) SELECT ?, chat_id FROM chats WHERE active=1",
-                     (pool_id,))
+    await db.execute("INSERT INTO pool_chats(pool_id, chat_id) SELECT CAST(? AS BIGINT), chat_id FROM chats "
+                     "WHERE active=1 ON CONFLICT DO NOTHING", (pool_id,))
     invalidate_pooled_cache()
     await cb.answer(f"Додано чатів: {await count_active_in_pool(pool_id) - before}", show_alert=True)
     text, kb = await render_pool(pool_id)
@@ -1093,8 +1046,8 @@ async def got_pool_name(message: Message, state: FSMContext):
     if not name or name.startswith("/"):
         return await message.answer("Назва не може бути порожньою. Спробуйте ще раз:", reply_markup=cancel_kb())
     try:
-        pid = await db.execute("INSERT INTO pools(name, invite_token) VALUES(?, ?)", (name, new_pool_token()))
-    except aiosqlite.IntegrityError:
+        pid = await db.insert("INSERT INTO pools(name, invite_token) VALUES(?, ?)", (name, new_pool_token()))
+    except IntegrityError:
         return await message.answer("Пул з такою назвою вже існує. Введіть іншу назву:", reply_markup=cancel_kb())
     await state.clear()
     text, kb = await render_pool(pid)
@@ -1210,7 +1163,7 @@ async def confirm_view(state: FSMContext) -> tuple[str, InlineKeyboardMarkup]:
 async def cb_task_confirm(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
     await state.clear()
-    tid = await db.execute(
+    tid = await db.insert(
         """INSERT INTO tasks(pool_id, src_chat_id, src_message_id, preview, schedule_type, schedule_value,
                              enabled, created_by, created_at) VALUES(?, ?, ?, ?, ?, ?, 1, ?, ?)""",
         (d["pool_id"], d["src_chat_id"], d["src_message_id"], d["preview"], d["schedule_type"],
@@ -1369,7 +1322,8 @@ async def cb_pick_chats(cb: CallbackQuery, state: FSMContext):
         "Натисніть кнопку внизу, оберіть групу чи канал і підтвердьте додавання бота. "
         "Ви залишитеся тут, тож одразу можна обирати наступний чат.\n\n"
         f"Коли закінчите — натисніть «{DONE_TEXT}».\n"
-        "<i>Список показує лише чати, де ви адміністратор.</i>",
+        "<i>Telegram показує тут лише чати, де ви адміністратор із правом «Додавати адміністраторів». "
+        "Інші групи додавайте через «➕ Додати в групу» на попередньому екрані.</i>",
         reply_markup=pick_chats_kb(pool_id, pool["name"]))
 
 
@@ -1545,10 +1499,10 @@ async def cb_relay_mode(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await state.clear()
     try:
-        rid = await db.execute(
+        rid = await db.insert(
             "INSERT INTO relays(source_chat_id, pool_id, mode, created_at) VALUES(?, ?, ?, ?)",
             (data["source_chat_id"], data["pool_id"], mode, datetime.now(TZ).strftime(DT_STORE)))
-    except aiosqlite.IntegrityError:
+    except IntegrityError:
         existing = await db.fetchone("SELECT id FROM relays WHERE source_chat_id=? AND pool_id=?",
                                      (data["source_chat_id"], data["pool_id"]))
         await cb.answer("Таке автопересилання вже існує", show_alert=True)
@@ -1679,7 +1633,9 @@ async def add_admin(user_id: int, name: str | None, added_by: int) -> str:
         return f"👑 {esc(user_label(name, user_id))} — уже власник"
     if user_id in _db_admins:
         return f"ℹ️ {esc(user_label(name, user_id))} — уже адміністратор"
-    await db.execute("INSERT OR REPLACE INTO admins(user_id, name, added_by, added_at) VALUES(?, ?, ?, ?)",
+    await db.execute("INSERT INTO admins(user_id, name, added_by, added_at) VALUES(?, ?, ?, ?) "
+                     "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, added_by=excluded.added_by, "
+                     "added_at=excluded.added_at",
                      (user_id, name, added_by, datetime.now(TZ).strftime(DT_STORE)))
     _db_admins.add(user_id)
     try:
@@ -1904,35 +1860,137 @@ async def not_admin_cb(cb: CallbackQuery):
 
 # ─────────────────────────── Запуск ───────────────────────────
 
+# ─────────────────────────── Запуск і блокування лідера ───────────────────────────
+# Якщо одночасно працюють кілька копій бота (під час деплою на Render нова копія стартує ще до зупинки старої),
+# лише лідер отримує оновлення від Telegram, виконує розсилки й автопересилання. Інші копії чекають.
+
+LEADER_TTL = int(os.getenv("LEADER_TTL", "60"))  # сек: якщо лідер зник, інша копія перейме роботу після цього часу
+LEADER_WAIT_INTERVAL = 5
+_runtime = {"role": "starting", "since": None, "lost": False, "holder": None}
+
+
+async def wait_for_leadership(lock: LeaderLock) -> None:
+    announced = False
+    while True:
+        try:
+            if await lock.try_acquire():
+                _runtime.update(role="leader", since=datetime.now(TZ).isoformat(timespec="seconds"),
+                                holder=lock.holder)
+                log.info("This instance is the leader (%s)", lock.holder)
+                return
+            if not announced:
+                current = await lock.current_holder()
+                log.info("Standby: another instance is the leader (%s). Waiting…",
+                         current["holder"] if current else "?")
+                _runtime["role"] = "standby"
+                announced = True
+        except Exception:  # noqa: BLE001 — база тимчасово недоступна: пробуємо ще
+            log.exception("Leader lock check failed")
+        await asyncio.sleep(LEADER_WAIT_INTERVAL)
+
+
+async def leadership_heartbeat(lock: LeaderLock) -> None:
+    """Продовжує оренду лідера. Якщо її перехопили або продовжити не вдається довше за TTL —
+    зупиняє бота, щоб дві копії не працювали одночасно (платформа перезапустить процес у режимі очікування)."""
+    interval = max(5, LEADER_TTL // 3)
+    last_ok = time.monotonic()
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            if await lock.try_acquire():
+                last_ok = time.monotonic()
+                continue
+            log.error("Leadership was taken over by another instance — stopping")
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to renew leader lock")
+            if time.monotonic() - last_ok < LEADER_TTL * 0.75:
+                continue
+            log.error("Could not renew leader lock before it expires — stopping to avoid duplicate sends")
+        _runtime.update(role="lost", lost=True)
+        if scheduler.running:
+            scheduler.pause()  # негайно зупиняємо розсилки
+        await dp.stop_polling()
+        return
+
+
 async def main() -> None:
     await db.init()
-    await load_admins()
-    scheduler.start()
-    await restore_jobs()
-    if LOG_RETENTION_DAYS > 0:
-        await cleanup_logs()
-        scheduler.add_job(cleanup_logs, CronTrigger(hour=3, minute=30, timezone=TZ), id="cleanup_logs",
-                          replace_existing=True)
-    dp.include_routers(groups_router, admin_router, public_router)
-    await bot.set_my_commands(
-        [BotCommand(command="admin", description="Адмін-панель"),
-         BotCommand(command="cancel", description="Скасувати дію")],
-        scope=BotCommandScopeAllPrivateChats())
-    await bot.set_my_commands(
-        [BotCommand(command="register", description="Зареєструвати чат для розсилок")],
-        scope=BotCommandScopeAllGroupChats())
-    # Бот працює через polling, тож webhook (якщо його колись встановили для цього токена) треба вимкнути,
-    # інакше Telegram повертає TelegramConflictError.
-    webhook = await bot.get_webhook_info()
-    if webhook.url:
-        log.warning("Active webhook found (%s) — deleting it to use polling", webhook.url)
-        await bot.delete_webhook(drop_pending_updates=False)
-    log.info("Bot started. Owners: %s, admins from DB: %s, TZ: %s", ADMIN_IDS, _db_admins, TZ.key)
+    # HTTP-ендпоінт стартує одразу, щоб хостинг бачив відкритий порт навіть у режимі очікування
+    health_runner = await start_health_server()
+    lock = LeaderLock(db, ttl=LEADER_TTL)
+    heartbeat_task = None
     try:
+        await wait_for_leadership(lock)
+        await load_admins()
+        scheduler.start()
+        await restore_jobs()
+        if LOG_RETENTION_DAYS > 0:
+            await cleanup_logs()
+            scheduler.add_job(cleanup_logs, CronTrigger(hour=3, minute=30, timezone=TZ), id="cleanup_logs",
+                              replace_existing=True)
+        dp.include_routers(groups_router, admin_router, public_router)
+        await bot.set_my_commands(
+            [BotCommand(command="admin", description="Адмін-панель"),
+             BotCommand(command="cancel", description="Скасувати дію")],
+            scope=BotCommandScopeAllPrivateChats())
+        await bot.set_my_commands(
+            [BotCommand(command="register", description="Зареєструвати чат для розсилок")],
+            scope=BotCommandScopeAllGroupChats())
+        # Бот працює через polling, тож webhook (якщо його колись встановили для цього токена) треба вимкнути,
+        # інакше Telegram повертає TelegramConflictError.
+        webhook = await bot.get_webhook_info()
+        if webhook.url:
+            log.warning("Active webhook found (%s) — deleting it to use polling", webhook.url)
+            await bot.delete_webhook(drop_pending_updates=False)
+        heartbeat_task = asyncio.create_task(leadership_heartbeat(lock))
+        log.info("Bot started. Owners: %s, admins from DB: %s, TZ: %s", ADMIN_IDS, _db_admins, TZ.key)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        scheduler.shutdown(wait=False)
+        if heartbeat_task:
+            heartbeat_task.cancel()
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        if _runtime["role"] == "leader":
+            try:
+                await lock.release()  # нова копія одразу перейме роботу, не чекаючи TTL
+                log.info("Leader lock released")
+            except Exception:  # noqa: BLE001
+                log.exception("Failed to release leader lock")
+        if health_runner:
+            await health_runner.cleanup()
         await bot.session.close()
+        await db.close()
+    if _runtime["lost"]:
+        raise SystemExit(1)
+
+
+async def start_health_server():
+    """HTTP-ендпоінт стану. Вмикається лише якщо задано змінну PORT (її автоматично задає Render Web Service).
+    Для Background Worker / VPS не потрібен і не запускається. Його ж «пінгує» UptimeRobot, щоб сервіс не засинав."""
+    port = os.getenv("PORT")
+    if not port:
+        return None
+    from aiohttp import web
+
+    started = datetime.now(TZ)
+
+    async def health(_request):
+        return web.json_response({
+            "status": "ok",
+            "role": _runtime["role"],  # leader | standby | lost
+            "since": started.isoformat(timespec="seconds"),
+            "jobs": len(scheduler.get_jobs()) if scheduler.running else 0,
+            "db": db.dialect,
+        })
+
+    app = web.Application()
+    app.router.add_get("/", health)  # add_get автоматично обробляє й HEAD-запити моніторингів
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
+    log.info("Health endpoint listening on port %s", port)
+    return runner
 
 
 if __name__ == "__main__":
