@@ -58,6 +58,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     KeyboardButtonRequestChat,
+    KeyboardButtonRequestUsers,
     Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
@@ -76,6 +77,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# Власники бота (з .env): повний доступ, керують адміністраторами, не можуть бути видалені через бота.
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Kyiv"))
 DB_PATH = os.getenv("DB_PATH", "bot.db")
@@ -166,6 +168,26 @@ CREATE TABLE IF NOT EXISTS chat_logs (
     PRIMARY KEY (chat_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_chat_logs_date ON chat_logs(date_utc);
+-- Адміністратори, додані через бота (власники задаються в .env → ADMIN_IDS)
+CREATE TABLE IF NOT EXISTS admins (
+    user_id   INTEGER PRIMARY KEY,
+    name      TEXT,
+    added_by  INTEGER,
+    added_at  TEXT
+);
+-- Автопересилання: нові дописи каналу-джерела автоматично надсилаються в чати пулу
+CREATE TABLE IF NOT EXISTS relays (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_chat_id  INTEGER NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
+    pool_id         INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+    mode            TEXT NOT NULL DEFAULT 'copy',   -- copy | forward
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    posts_count     INTEGER NOT NULL DEFAULT 0,
+    last_post_at    TEXT,
+    last_result     TEXT,
+    created_at      TEXT,
+    UNIQUE (source_chat_id, pool_id)
+);
 """
 
 
@@ -235,6 +257,28 @@ class DB:
 
 
 db = DB(DB_PATH)
+
+# ─────────────────────────── Адміністратори ───────────────────────────
+
+_db_admins: set[int] = set()  # кеш адміністраторів з БД (бот працює одним процесом)
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS or user_id in _db_admins
+
+
+def admin_ids() -> set[int]:
+    return set(ADMIN_IDS) | _db_admins
+
+
+async def load_admins() -> None:
+    rows = await db.fetchall("SELECT user_id FROM admins")
+    _db_admins.clear()
+    _db_admins.update(r["user_id"] for r in rows)
 
 
 async def upsert_chat(chat_id: int, title: str, chat_type: str) -> None:
@@ -383,10 +427,16 @@ async def notify(user_ids, text: str) -> None:
 
 
 async def send_copy(chat_id: int, from_chat_id: int, message_id: int) -> str | None:
-    """Повертає None при успіху або текст помилки."""
+    return await deliver(chat_id, lambda cid: bot.copy_message(
+        chat_id=cid, from_chat_id=from_chat_id, message_id=message_id))
+
+
+async def deliver(chat_id: int, send) -> str | None:
+    """Надсилає з обробкою лімітів і помилок. send(chat_id) — корутина відправки.
+    Повертає None при успіху або текст помилки."""
     for _ in range(3):
         try:
-            await bot.copy_message(chat_id=chat_id, from_chat_id=from_chat_id, message_id=message_id)
+            await send(chat_id)
             return None
         except TelegramRetryAfter as e:
             log.warning("Flood control for %s, sleeping %ss", chat_id, e.retry_after)
@@ -430,7 +480,7 @@ async def run_task(task_id: int, force: bool = False, report_to: int | None = No
         await db.execute("UPDATE tasks SET enabled=0 WHERE id=?", (task_id,))
 
     log.info("Task #%s done: %s/%s", task_id, ok, len(chats))
-    recipients = set(ADMIN_IDS) if NOTIFY_ADMINS else set()
+    recipients = set(admin_ids()) if NOTIFY_ADMINS else set()
     if report_to:
         recipients.add(report_to)
     if recipients:
@@ -451,7 +501,9 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     kb.button(text="👥 Пули чатів", callback_data="pools")
     kb.button(text="💬 Чати", callback_data="chats")
     kb.button(text="📊 Логи чатів", callback_data="logs")
-    kb.adjust(1, 1, 2, 1)
+    kb.button(text="🔁 Автопересилання", callback_data="relays")
+    kb.button(text="👤 Адміністратори", callback_data="admins")
+    kb.adjust(1, 1, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -492,11 +544,21 @@ MAIN_TEXT = "🛠 <b>Адмін-панель розсилок</b>\nОберіт�
 class IsAdmin(Filter):
     async def __call__(self, event) -> bool:
         user = getattr(event, "from_user", None)
-        return bool(user and user.id in ADMIN_IDS)
+        return bool(user and is_admin(user.id))
 
 
 class PoolForm(StatesGroup):
     name = State()
+
+
+class AdminForm(StatesGroup):
+    user_id = State()
+
+
+class RelayForm(StatesGroup):
+    source = State()
+    pool = State()
+    mode = State()
 
 
 class TaskForm(StatesGroup):
@@ -522,17 +584,17 @@ async def on_bot_added(event: ChatMemberUpdated):
         return
     title = event.chat.title or str(event.chat.id)
     adder = event.from_user
-    if RESTRICT_ADD and adder.id not in ADMIN_IDS:
+    if RESTRICT_ADD and not is_admin(adder.id):
         log.warning("Bot added to %s by non-admin %s — leaving", event.chat.id, adder.id)
         try:
             await bot.leave_chat(event.chat.id)
         except TelegramBadRequest:
             pass
-        await notify(ADMIN_IDS, f"⚠️ Не-адмін (<code>{adder.id}</code>) додав бота в «{esc(title)}». Бот вийшов з чату.")
+        await notify(admin_ids(), f"⚠️ Не-адмін (<code>{adder.id}</code>) додав бота в «{esc(title)}». Бот вийшов з чату.")
         return
     await upsert_chat(event.chat.id, title, event.chat.type)
     # Тому, хто додав бота, окреме сповіщення не потрібне — він отримає підтвердження у процесі додавання
-    await notify(ADMIN_IDS - {adder.id}, f"➕ Бота додано в чат <b>{esc(title)}</b> (<code>{event.chat.id}</code>).\n"
+    await notify(admin_ids() - {adder.id}, f"➕ Бота додано в чат <b>{esc(title)}</b> (<code>{event.chat.id}</code>).\n"
                             f"<i>Якщо чат не потрапить у пул автоматично — призначте його в /admin → «Пули чатів».</i>")
 
     pending = _pending_pool.get(adder.id)
@@ -553,7 +615,7 @@ async def add_chat_to_pool(pool_id: int, chat_id: int, title: str, notify_admins
     await db.execute("INSERT OR IGNORE INTO pool_chats(pool_id, chat_id) VALUES(?, ?)", (pool_id, chat_id))
     invalidate_pooled_cache()
     if notify_admins:
-        await notify(ADMIN_IDS, f"📥 Чат <b>{esc(title)}</b> автоматично додано до пулу <b>{esc(pool['name'])}</b>.")
+        await notify(admin_ids(), f"📥 Чат <b>{esc(title)}</b> автоматично додано до пулу <b>{esc(pool['name'])}</b>.")
     return True
 
 
@@ -563,7 +625,7 @@ async def on_group_start_link(message: Message, command: CommandObject):
     payload = command.args or ""
     if not payload.startswith(POOL_PAYLOAD_PREFIX):
         return
-    if RESTRICT_ADD and (not message.from_user or message.from_user.id not in ADMIN_IDS):
+    if RESTRICT_ADD and (not message.from_user or not is_admin(message.from_user.id)):
         return  # бот уже виходить з чату в on_bot_added
     pool = await db.fetchone("SELECT id, name FROM pools WHERE invite_token=?",
                              (payload[len(POOL_PAYLOAD_PREFIX):],))
@@ -581,7 +643,7 @@ async def on_bot_removed(event: ChatMemberUpdated):
     if event.chat.type == ChatType.PRIVATE:
         return
     await set_chat_active(event.chat.id, False)
-    await notify(ADMIN_IDS, f"➖ Бота видалено з чату <b>{esc(event.chat.title)}</b> (<code>{event.chat.id}</code>). "
+    await notify(admin_ids(), f"➖ Бота видалено з чату <b>{esc(event.chat.title)}</b> (<code>{event.chat.id}</code>). "
                             f"Чат позначено неактивним.")
 
 
@@ -664,6 +726,80 @@ async def on_chat_message(message: Message):
         await log_message(message)
     except Exception:  # noqa: BLE001 — збій логування не повинен впливати на роботу бота
         log.exception("Failed to log message %s in %s", message.message_id, message.chat.id)
+    if message.chat.type == ChatType.CHANNEL and message.edit_date is None:
+        try:
+            await relay_post(message)
+        except Exception:  # noqa: BLE001
+            log.exception("Relay failed for post %s in %s", message.message_id, message.chat.id)
+
+
+# ─────────────────────────── Автопересилання з каналу ───────────────────────────
+
+ALBUM_WAIT = 2.0  # сек: дописи-альбоми приходять кількома оновленнями — збираємо їх разом
+_album_buffer: dict[tuple[int, str], list[int]] = {}
+_relay_locks: dict[int, asyncio.Lock] = {}
+
+
+async def relay_post(message: Message) -> None:
+    relays = await db.fetchall("SELECT * FROM relays WHERE source_chat_id=? AND enabled=1", (message.chat.id,))
+    if not relays:
+        return
+    ctype = str(message.content_type.value if hasattr(message.content_type, "value") else message.content_type)
+    if ctype not in LOGGED_TYPES:
+        return  # службові дописи (закріплення, зміна назви тощо) не пересилаємо
+    if message.media_group_id:
+        key = (message.chat.id, message.media_group_id)
+        buffer = _album_buffer.setdefault(key, [])
+        buffer.append(message.message_id)
+        if len(buffer) == 1:
+            spawn(flush_album(key))
+        return
+    for relay in relays:
+        spawn(run_relay(relay["id"], message.chat.id, [message.message_id]))
+
+
+async def flush_album(key: tuple[int, str]) -> None:
+    await asyncio.sleep(ALBUM_WAIT)
+    ids = sorted(_album_buffer.pop(key, []))
+    relays = await db.fetchall("SELECT id FROM relays WHERE source_chat_id=? AND enabled=1", (key[0],))
+    for relay in relays:
+        spawn(run_relay(relay["id"], key[0], ids))
+
+
+async def run_relay(relay_id: int, from_chat_id: int, message_ids: list[int]) -> None:
+    # Лок на кожне правило: дописи йдуть у чати в тому ж порядку, що й у каналі
+    async with _relay_locks.setdefault(relay_id, asyncio.Lock()):
+        relay = await db.fetchone("SELECT * FROM relays WHERE id=?", (relay_id,))
+        if not relay or not relay["enabled"]:
+            return
+        chats = await db.fetchall(
+            """SELECT c.chat_id, c.title FROM chats c JOIN pool_chats pc ON pc.chat_id = c.chat_id
+               WHERE pc.pool_id=? AND c.active=1 AND c.chat_id != ?""",
+            (relay["pool_id"], from_chat_id),
+        )
+        if relay["mode"] == "forward":
+            def send(cid):
+                return bot.forward_messages(chat_id=cid, from_chat_id=from_chat_id, message_ids=message_ids)
+        else:
+            def send(cid):
+                return bot.copy_messages(chat_id=cid, from_chat_id=from_chat_id, message_ids=message_ids)
+        ok, errors = 0, []
+        for chat in chats:
+            err = await deliver(chat["chat_id"], send)
+            if err is None:
+                ok += 1
+            else:
+                errors.append(f"• {esc(chat['title'])}: {esc(err)}")
+            await asyncio.sleep(SEND_DELAY)
+        result = f"{ok}/{len(chats)}"
+        await db.execute(
+            "UPDATE relays SET posts_count=posts_count+1, last_post_at=?, last_result=? WHERE id=?",
+            (datetime.now(TZ).strftime(DT_STORE), result, relay_id))
+        log.info("Relay #%s: post %s delivered %s", relay_id, message_ids, result)
+        if chats and ok == 0:
+            # Жодна доставка не вдалася — найімовірніше, проблема з налаштуваннями (напр., захищений вміст каналу)
+            await notify(admin_ids(), f"⚠️ Автопересилання #{relay_id}: допис не доставлено в жоден чат.\n"
+                                    + "\n".join(errors[:10]))
 
 
 async def cleanup_logs() -> None:
@@ -1237,6 +1373,29 @@ async def cb_pick_chats(cb: CallbackQuery, state: FSMContext):
         reply_markup=pick_chats_kb(pool_id, pool["name"]))
 
 
+RELAY_SOURCE_REQUEST_ID = 2_000_000_000  # не перетинається з request_id пулів (pool_id * 2 [+1])
+CANCEL_TEXT = "❌ Скасувати"
+
+
+@admin_router.message(F.chat_shared.request_id == RELAY_SOURCE_REQUEST_ID)
+async def on_relay_source_shared(message: Message, state: FSMContext):
+    shared = message.chat_shared
+    try:
+        me = await bot.me()
+        member = await bot.get_chat_member(shared.chat_id, me.id)
+        chat = await bot.get_chat(shared.chat_id)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return await message.answer("⚠️ Бот не отримав доступу до каналу. Спробуйте ще раз і підтвердьте "
+                                    "додавання бота.")
+    if member.status != "administrator":
+        return await message.answer("⚠️ Бот має бути адміністратором каналу, щоб бачити нові дописи. "
+                                    "Спробуйте ще раз і підтвердьте додавання.")
+    title = chat.title or shared.title or str(shared.chat_id)
+    await upsert_chat(shared.chat_id, title, chat.type)
+    await message.answer(f"📢 Джерело: <b>{esc(title)}</b>", reply_markup=ReplyKeyboardRemove())
+    await relay_choose_pool(message, state, shared.chat_id)
+
+
 @admin_router.message(F.chat_shared)
 async def on_chat_shared(message: Message):
     shared = message.chat_shared
@@ -1259,7 +1418,7 @@ async def on_chat_shared(message: Message):
     status = "додано до пулу" if added else "вже є в пулі"
     await message.answer(f"✅ <b>{esc(title)}</b> {status} <b>{esc(pool['name'])}</b>. "
                          f"Чатів у пулі: {n}.\nОбирайте наступний або натисніть «{DONE_TEXT}».")
-    others = ADMIN_IDS - {message.from_user.id}
+    others = admin_ids() - {message.from_user.id}
     if added and others:
         await notify(others, f"📥 Чат <b>{esc(title)}</b> додано до пулу <b>{esc(pool['name'])}</b>.")
 
@@ -1269,6 +1428,337 @@ async def on_pick_done(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Готово.", reply_markup=ReplyKeyboardRemove())
     await message.answer(MAIN_TEXT, reply_markup=main_menu_kb())
+
+
+@admin_router.message(F.text == CANCEL_TEXT)
+async def on_reply_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Скасовано.", reply_markup=ReplyKeyboardRemove())
+    await message.answer(MAIN_TEXT, reply_markup=main_menu_kb())
+
+
+# ─────────────────────────── Адмін: автопересилання ───────────────────────────
+
+MODE_LABELS = {
+    "copy": "📋 Копія (без позначки «Переслано з»)",
+    "forward": "↪️ Пересилання (з позначкою та посиланням на канал)",
+}
+
+
+@admin_router.callback_query(F.data == "relays")
+async def cb_relays(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    relays = await db.fetchall(
+        """SELECT r.*, c.title AS source_title, p.name AS pool_name FROM relays r
+           JOIN chats c ON c.chat_id = r.source_chat_id JOIN pools p ON p.id = r.pool_id
+           ORDER BY r.enabled DESC, r.id""")
+    kb = InlineKeyboardBuilder()
+    for r in relays:
+        kb.button(text=f"{'🟢' if r['enabled'] else '⚪️'} {r['source_title'][:22]} → {r['pool_name'][:18]}",
+                  callback_data=f"rl:{r['id']}")
+    kb.button(text="➕ Нове автопересилання", callback_data="rnew")
+    kb.button(text="⬅️ Меню", callback_data="menu")
+    kb.adjust(1)
+    text = ("🔁 <b>Автопересилання</b>\nНові дописи каналу-джерела автоматично надсилаються в усі чати пулу."
+            if relays else "🔁 Автопересилань ще немає. Створіть перше: оберіть канал-джерело і пул.")
+    await safe_edit(cb, text, kb.as_markup())
+
+
+@admin_router.callback_query(F.data == "rnew")
+async def cb_relay_new(cb: CallbackQuery, state: FSMContext):
+    if not (await db.fetchone("SELECT COUNT(*) AS n FROM pools"))["n"]:
+        return await cb.answer("Спочатку створіть пул чатів", show_alert=True)
+    await state.clear()
+    await state.set_state(RelayForm.source)
+    # Щоб канал-джерело випадково не потрапив у пул через «режим прийому каналів» — вимикаємо його
+    pending = _pending_pool.get(cb.from_user.id)
+    if pending and not pending["all_types"]:
+        _pending_pool.pop(cb.from_user.id, None)
+    channels = await db.fetchall("SELECT chat_id, title FROM chats WHERE type='channel' AND active=1 ORDER BY title")
+    kb = InlineKeyboardBuilder()
+    for c in channels:
+        kb.button(text=f"📢 {c['title'][:40]}", callback_data=f"rs:{c['chat_id']}")
+    kb.button(text="❌ Скасувати", callback_data="cancel")
+    kb.adjust(1)
+    text = "🔁 <b>Нове автопересилання</b>\n\nОберіть канал-джерело"
+    text += " зі списку або кнопкою під полем вводу." if channels else " кнопкою під полем вводу."
+    await safe_edit(cb, text, kb.as_markup())
+    admin_rights = rights(can_manage_chat=True)
+    await cb.message.answer(
+        "Якщо бота ще немає в потрібному каналі — натисніть «📢 Обрати канал-джерело»: бот додасться "
+        "адміністратором (без права публікації), щоб бачити нові дописи.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[
+            [KeyboardButton(text="📢 Обрати канал-джерело", request_chat=KeyboardButtonRequestChat(
+                request_id=RELAY_SOURCE_REQUEST_ID, chat_is_channel=True, request_title=True,
+                user_administrator_rights=admin_rights, bot_administrator_rights=admin_rights))],
+            [KeyboardButton(text=CANCEL_TEXT)],
+        ], resize_keyboard=True, one_time_keyboard=True))
+
+
+async def relay_choose_pool(message: Message, state: FSMContext, source_chat_id: int) -> None:
+    await state.update_data(source_chat_id=source_chat_id)
+    await state.set_state(RelayForm.pool)
+    pools = await db.fetchall("SELECT id, name FROM pools ORDER BY name")
+    kb = InlineKeyboardBuilder()
+    for p in pools:
+        kb.button(text=f"👥 {p['name']} ({await count_active_in_pool(p['id'])} чатів)", callback_data=f"rp:{p['id']}")
+    kb.button(text="❌ Скасувати", callback_data="cancel")
+    kb.adjust(1)
+    await message.answer("У який пул пересилати нові дописи?", reply_markup=kb.as_markup())
+
+
+@admin_router.callback_query(RelayForm.source, F.data.startswith("rs:"))
+async def cb_relay_source(cb: CallbackQuery, state: FSMContext):
+    chat = await db.fetchone("SELECT chat_id, title FROM chats WHERE chat_id=?", (int(cb.data.split(":")[1]),))
+    if not chat:
+        return await cb.answer("Канал не знайдено", show_alert=True)
+    await cb.answer()
+    await cb.message.answer(f"📢 Джерело: <b>{esc(chat['title'])}</b>", reply_markup=ReplyKeyboardRemove())
+    await relay_choose_pool(cb.message, state, chat["chat_id"])
+
+
+@admin_router.callback_query(RelayForm.pool, F.data.startswith("rp:"))
+async def cb_relay_pool(cb: CallbackQuery, state: FSMContext):
+    pool_id = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    n = (await db.fetchone(
+        """SELECT COUNT(*) AS n FROM pool_chats pc JOIN chats c ON c.chat_id = pc.chat_id
+           WHERE pc.pool_id=? AND c.active=1 AND c.chat_id != ?""", (pool_id, data["source_chat_id"])))["n"]
+    if n == 0:
+        return await cb.answer("У пулі немає активних чатів (крім самого джерела)", show_alert=True)
+    await state.update_data(pool_id=pool_id)
+    await state.set_state(RelayForm.mode)
+    kb = InlineKeyboardBuilder()
+    kb.button(text=MODE_LABELS["copy"], callback_data="rm:copy")
+    kb.button(text=MODE_LABELS["forward"], callback_data="rm:forward")
+    kb.button(text="❌ Скасувати", callback_data="cancel")
+    kb.adjust(1)
+    await safe_edit(cb, "Як надсилати дописи?\n\n<b>Копія</b> — виглядає як повідомлення від бота, без згадки каналу.\n"
+                        "<b>Пересилання</b> — з підписом «Переслано з …» і посиланням на канал.\n\n"
+                        "<i>Альбоми зберігаються в обох режимах. Редагування й видалення дописів у каналі "
+                        "в чати не передаються.</i>", kb.as_markup())
+
+
+@admin_router.callback_query(RelayForm.mode, F.data.startswith("rm:"))
+async def cb_relay_mode(cb: CallbackQuery, state: FSMContext):
+    mode = cb.data.split(":")[1]
+    data = await state.get_data()
+    await state.clear()
+    try:
+        rid = await db.execute(
+            "INSERT INTO relays(source_chat_id, pool_id, mode, created_at) VALUES(?, ?, ?, ?)",
+            (data["source_chat_id"], data["pool_id"], mode, datetime.now(TZ).strftime(DT_STORE)))
+    except aiosqlite.IntegrityError:
+        existing = await db.fetchone("SELECT id FROM relays WHERE source_chat_id=? AND pool_id=?",
+                                     (data["source_chat_id"], data["pool_id"]))
+        await cb.answer("Таке автопересилання вже існує", show_alert=True)
+        text, kb = await render_relay(existing["id"])
+        return await safe_edit(cb, text, kb)
+    text, kb = await render_relay(rid)
+    await safe_edit(cb, "✅ Автопересилання створено. Нові дописи каналу надсилатимуться в чати пулу.\n\n" + text, kb)
+
+
+async def render_relay(rid: int) -> tuple[str, InlineKeyboardMarkup]:
+    r = await db.fetchone(
+        """SELECT r.*, c.title AS source_title, c.active AS source_active, p.name AS pool_name FROM relays r
+           JOIN chats c ON c.chat_id = r.source_chat_id JOIN pools p ON p.id = r.pool_id WHERE r.id=?""", (rid,))
+    if not r:
+        return "Автопересилання не знайдено.", single_kb("relays", "⬅️ До списку")
+    last = datetime.strptime(r["last_post_at"], DT_STORE).strftime(DT_UI) if r["last_post_at"] else "—"
+    text = (f"🔁 <b>Автопересилання #{r['id']}</b>\n\n"
+            f"Статус: {'🟢 увімкнено' if r['enabled'] else '⚪️ вимкнено'}\n"
+            f"Джерело: 📢 {esc(r['source_title'])}"
+            f"{'' if r['source_active'] else ' ⚠️ бот не має доступу до каналу'}\n"
+            f"Пул: 👥 {esc(r['pool_name'])} ({await count_active_in_pool(r['pool_id'])} чатів)\n"
+            f"Режим: {MODE_LABELS.get(r['mode'], r['mode'])}\n"
+            f"Переслано дописів: {r['posts_count']}\n"
+            f"Останній: {last} (доставлено {r['last_result'] or '—'})")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏸ Вимкнути" if r["enabled"] else "▶️ Увімкнути", callback_data=f"rt:{rid}")
+    kb.button(text="🔄 Змінити режим", callback_data=f"rmode:{rid}")
+    kb.button(text="🗑 Видалити", callback_data=f"rd:{rid}")
+    kb.button(text="⬅️ До списку", callback_data="relays")
+    kb.adjust(2, 1, 1)
+    return text, kb.as_markup()
+
+
+@admin_router.callback_query(F.data.startswith("rl:"))
+async def cb_relay(cb: CallbackQuery):
+    text, kb = await render_relay(int(cb.data.split(":")[1]))
+    await safe_edit(cb, text, kb)
+
+
+@admin_router.callback_query(F.data.startswith("rt:"))
+async def cb_relay_toggle(cb: CallbackQuery):
+    rid = int(cb.data.split(":")[1])
+    await db.execute("UPDATE relays SET enabled = 1 - enabled WHERE id=?", (rid,))
+    text, kb = await render_relay(rid)
+    await safe_edit(cb, text, kb)
+
+
+@admin_router.callback_query(F.data.startswith("rmode:"))
+async def cb_relay_switch_mode(cb: CallbackQuery):
+    rid = int(cb.data.split(":")[1])
+    await db.execute("UPDATE relays SET mode = CASE mode WHEN 'copy' THEN 'forward' ELSE 'copy' END WHERE id=?", (rid,))
+    text, kb = await render_relay(rid)
+    await safe_edit(cb, text, kb)
+
+
+@admin_router.callback_query(F.data.startswith("rd:"))
+async def cb_relay_delete_ask(cb: CallbackQuery):
+    rid = int(cb.data.split(":")[1])
+    await safe_edit(cb, f"Видалити автопересилання #{rid}?", confirm_kb(f"rdok:{rid}", f"rl:{rid}"))
+
+
+@admin_router.callback_query(F.data.startswith("rdok:"))
+async def cb_relay_delete(cb: CallbackQuery, state: FSMContext):
+    await db.execute("DELETE FROM relays WHERE id=?", (int(cb.data.split(":")[1]),))
+    await cb_relays(cb, state)
+
+
+# ─────────────────────────── Адмін: керування адміністраторами ───────────────────────────
+# Додавати й видаляти адміністраторів можуть лише власники (ADMIN_IDS з .env).
+# Адміністратори мають доступ до всіх функцій панелі, крім керування адміністраторами.
+
+ADMIN_REQUEST_ID = 2_000_000_001
+OWNER_ONLY = "Керувати адміністраторами можуть лише власники бота"
+
+
+def user_label(name: str | None, user_id: int) -> str:
+    return f"{name} ({user_id})" if name else str(user_id)
+
+
+async def render_admins(viewer_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    rows = await db.fetchall("SELECT * FROM admins ORDER BY name, user_id")
+    lines = [f"👑 <code>{uid}</code> — власник" for uid in sorted(ADMIN_IDS)]
+    lines += [f"👤 {esc(r['name'] or '—')} — <code>{r['user_id']}</code>" for r in rows]
+    text = "👤 <b>Адміністратори</b>\n\n" + "\n".join(lines)
+    kb = InlineKeyboardBuilder()
+    if is_owner(viewer_id):
+        text += ("\n\nВласники задаються в .env і мають повний доступ. Додані адміністратори можуть робити все, "
+                 "крім керування адміністраторами.")
+        kb.button(text="➕ Додати адміністратора", callback_data="adm_add")
+        for r in rows:
+            kb.button(text=f"🗑 {(r['name'] or str(r['user_id']))[:35]}", callback_data=f"adm_del:{r['user_id']}")
+    else:
+        text += "\n\n<i>Додавати й видаляти адміністраторів можуть лише власники.</i>"
+    kb.button(text="⬅️ Меню", callback_data="menu")
+    kb.adjust(1)
+    return text, kb.as_markup()
+
+
+@admin_router.callback_query(F.data == "admins")
+async def cb_admins(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, kb = await render_admins(cb.from_user.id)
+    await safe_edit(cb, text, kb)
+
+
+@admin_router.callback_query(F.data == "adm_add")
+async def cb_admin_add(cb: CallbackQuery, state: FSMContext):
+    if not is_owner(cb.from_user.id):
+        return await cb.answer(OWNER_ONLY, show_alert=True)
+    await state.set_state(AdminForm.user_id)
+    await cb.answer()
+    await cb.message.answer(
+        "➕ <b>Додавання адміністраторів</b>\n\n"
+        "Натисніть «👤 Обрати користувачів» під полем вводу — можна обрати до 10 людей за раз.\n"
+        "Або надішліть числовий Telegram ID (людина може дізнатися його, написавши боту /start).\n\n"
+        "<i>Щоб отримувати сповіщення від бота, новий адміністратор має хоча б раз написати боту /start.</i>",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[
+            [KeyboardButton(text="👤 Обрати користувачів", request_users=KeyboardButtonRequestUsers(
+                request_id=ADMIN_REQUEST_ID, user_is_bot=False, max_quantity=10,
+                request_name=True, request_username=True))],
+            [KeyboardButton(text=CANCEL_TEXT)],
+        ], resize_keyboard=True, one_time_keyboard=True))
+
+
+async def add_admin(user_id: int, name: str | None, added_by: int) -> str:
+    """Додає адміністратора, повертає рядок-результат для звіту."""
+    if is_owner(user_id):
+        return f"👑 {esc(user_label(name, user_id))} — уже власник"
+    if user_id in _db_admins:
+        return f"ℹ️ {esc(user_label(name, user_id))} — уже адміністратор"
+    await db.execute("INSERT OR REPLACE INTO admins(user_id, name, added_by, added_at) VALUES(?, ?, ?, ?)",
+                     (user_id, name, added_by, datetime.now(TZ).strftime(DT_STORE)))
+    _db_admins.add(user_id)
+    try:
+        await bot.send_message(user_id, "✅ Вас призначено адміністратором бота розсилок. Відкрийте панель: /admin")
+        delivered = ""
+    except (TelegramForbiddenError, TelegramBadRequest):
+        delivered = " (сповіщення не доставлено — людині треба написати боту /start)"
+    return f"✅ {esc(user_label(name, user_id))} — додано{delivered}"
+
+
+async def finish_admin_add(message: Message, state: FSMContext, results: list[str]) -> None:
+    await state.clear()
+    await message.answer("\n".join(results), reply_markup=ReplyKeyboardRemove())
+    added = [r for r in results if r.startswith("✅")]
+    others = set(ADMIN_IDS) - {message.from_user.id}
+    if added and others:  # аудит: інші власники бачать зміни складу адміністраторів
+        await notify(others, f"👤 Власник <code>{message.from_user.id}</code> додав адміністраторів:\n" + "\n".join(added))
+    text, kb = await render_admins(message.from_user.id)
+    await message.answer(text, reply_markup=kb)
+
+
+@admin_router.message(F.users_shared.request_id == ADMIN_REQUEST_ID)
+async def on_admin_users_shared(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return await message.answer(OWNER_ONLY, reply_markup=ReplyKeyboardRemove())
+    results = []
+    for u in message.users_shared.users:
+        name = " ".join(x for x in (u.first_name, u.last_name) if x) or (f"@{u.username}" if u.username else None)
+        results.append(await add_admin(u.user_id, name, message.from_user.id))
+    await finish_admin_add(message, state, results)
+
+
+@admin_router.message(AdminForm.user_id, F.text)
+async def on_admin_id_entered(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return await message.answer(OWNER_ONLY, reply_markup=ReplyKeyboardRemove())
+    raw = message.text.strip()
+    if not raw.isdigit():
+        return await message.answer("Надішліть числовий Telegram ID або оберіть людину кнопкою під полем вводу.")
+    user_id = int(raw)
+    name = None
+    try:  # ім'я вдасться отримати, лише якщо людина вже писала боту
+        chat = await bot.get_chat(user_id)
+        name = " ".join(x for x in (chat.first_name, chat.last_name) if x) or chat.username
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
+    await finish_admin_add(message, state, [await add_admin(user_id, name, message.from_user.id)])
+
+
+@admin_router.callback_query(F.data.startswith("adm_del:"))
+async def cb_admin_delete_ask(cb: CallbackQuery):
+    if not is_owner(cb.from_user.id):
+        return await cb.answer(OWNER_ONLY, show_alert=True)
+    uid = int(cb.data.split(":")[1])
+    row = await db.fetchone("SELECT name FROM admins WHERE user_id=?", (uid,))
+    await safe_edit(cb, f"Позбавити прав адміністратора: <b>{esc(user_label(row['name'] if row else None, uid))}</b>?",
+                    confirm_kb(f"adm_delok:{uid}", "admins"))
+
+
+@admin_router.callback_query(F.data.startswith("adm_delok:"))
+async def cb_admin_delete(cb: CallbackQuery, state: FSMContext):
+    if not is_owner(cb.from_user.id):
+        return await cb.answer(OWNER_ONLY, show_alert=True)
+    uid = int(cb.data.split(":")[1])
+    row = await db.fetchone("SELECT name FROM admins WHERE user_id=?", (uid,))
+    await db.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+    _db_admins.discard(uid)
+    _pending_pool.pop(uid, None)  # вимикаємо його «режим прийому», якщо був
+    label = esc(user_label(row["name"] if row else None, uid))
+    try:
+        await bot.send_message(uid, "Ваші права адміністратора бота розсилок скасовано.")
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+    others = set(ADMIN_IDS) - {cb.from_user.id}
+    if others:
+        await notify(others, f"👤 Власник <code>{cb.from_user.id}</code> видалив адміністратора {label}")
+    await cb.answer("Адміністратора видалено", show_alert=True)
+    await cb_admins(cb, state)
 
 
 # ─────────────────────────── Адмін: логи чатів ───────────────────────────
@@ -1416,6 +1906,7 @@ async def not_admin_cb(cb: CallbackQuery):
 
 async def main() -> None:
     await db.init()
+    await load_admins()
     scheduler.start()
     await restore_jobs()
     if LOG_RETENTION_DAYS > 0:
@@ -1436,7 +1927,7 @@ async def main() -> None:
     if webhook.url:
         log.warning("Active webhook found (%s) — deleting it to use polling", webhook.url)
         await bot.delete_webhook(drop_pending_updates=False)
-    log.info("Bot started. Admins: %s, TZ: %s", ADMIN_IDS, TZ.key)
+    log.info("Bot started. Owners: %s, admins from DB: %s, TZ: %s", ADMIN_IDS, _db_admins, TZ.key)
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
